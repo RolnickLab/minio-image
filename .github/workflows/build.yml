@@ -1,0 +1,105 @@
+name: Build and push image
+
+# Builds insectai/minio for linux/amd64 and linux/arm64 from the sources pinned in versions.env.
+# Pull requests only build (no push). Pushes to main and manual runs build and push.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - Dockerfile
+      - versions.env
+      - .github/workflows/build.yml
+  pull_request:
+    paths:
+      - Dockerfile
+      - versions.env
+      - .github/workflows/build.yml
+  workflow_dispatch:
+    inputs:
+      push:
+        description: Push the image to Docker Hub
+        type: boolean
+        default: true
+      tag_latest:
+        description: Also move the latest tag
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+env:
+  IMAGE: insectai/minio
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Load pinned versions
+        run: cat versions.env | grep -v '^#' | grep . >> "$GITHUB_ENV"
+
+      - name: Decide whether to push
+        id: mode
+        run: |
+          push=false; latest=false
+          if [ "${{ github.event_name }}" = "push" ]; then push=true; latest=true; fi
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            push="${{ inputs.push }}"; latest="${{ inputs.tag_latest }}"
+          fi
+          echo "push=$push" >> "$GITHUB_OUTPUT"
+          tags="$IMAGE:$MINIO_TAG"
+          if [ "$latest" = "true" ]; then tags="$tags,$IMAGE:latest"; fi
+          echo "tags=$tags" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        if: steps.mode.outputs.push == 'true'
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build (and push)
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: ${{ steps.mode.outputs.push == 'true' }}
+          tags: ${{ steps.mode.outputs.tags }}
+          build-args: |
+            GO_IMAGE=${{ env.GO_IMAGE }}
+            RUNTIME_IMAGE=${{ env.RUNTIME_IMAGE }}
+            MINIO_REPO=${{ env.MINIO_REPO }}
+            MINIO_TAG=${{ env.MINIO_TAG }}
+            MINIO_COMMIT=${{ env.MINIO_COMMIT }}
+            MC_REPO=${{ env.MC_REPO }}
+            MC_TAG=${{ env.MC_TAG }}
+            MC_COMMIT=${{ env.MC_COMMIT }}
+            SOURCE_REVISION=${{ github.sha }}
+          # Keep the manifest list to the two real platforms so `docker manifest inspect` stays readable.
+          provenance: false
+          sbom: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Write the pin line for compose files
+        if: steps.mode.outputs.push == 'true'
+        run: |
+          {
+            echo "## Published"
+            echo
+            echo "Copy this into docker-compose files to pin the image:"
+            echo
+            echo '```'
+            echo "image: $IMAGE:$MINIO_TAG@${{ steps.build.outputs.digest }}"
+            echo '```'
+            echo
+            echo "Server: \`$MINIO_REPO\` @ \`$MINIO_TAG\` (\`$MINIO_COMMIT\`)"
+            echo
+            echo "Client: \`$MC_REPO\` @ \`$MC_TAG\` (\`$MC_COMMIT\`)"
+          } >> "$GITHUB_STEP_SUMMARY"
