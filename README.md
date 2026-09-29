@@ -25,10 +25,10 @@ Exact source revisions are recorded in `versions.env` and in the image labels (`
 
 ## Using the image
 
-Pin by tag and digest in compose files. The digest for each published tag is printed in the workflow run's summary, or:
+Pin by tag and digest in compose files. The digest for each published tag is printed in the workflow run's summary. To look it up later, read the first `Digest:` line (the manifest list, which covers both platforms) from:
 
 ```sh
-docker buildx imagetools inspect insectai/minio:RELEASE.2026-09-16T00-00-00Z --format '{{json .Manifest.Digest}}'
+docker buildx imagetools inspect insectai/minio:RELEASE.2026-09-16T00-00-00Z
 ```
 
 ```yaml
