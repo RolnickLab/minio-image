@@ -1,6 +1,7 @@
 name: Build and push image
 
 # Builds insectai/minio for linux/amd64 and linux/arm64 from the sources pinned in versions.env.
+# Every run first builds linux/amd64 into the runner's Docker daemon and runs test/smoke.sh against it.
 # Pull requests only build (no push). Pushes to main and manual runs build and push.
 
 on:
@@ -9,11 +10,17 @@ on:
     paths:
       - Dockerfile
       - versions.env
+      - docker-entrypoint.sh
+      - minio-healthcheck
+      - test/**
       - .github/workflows/build.yml
   pull_request:
     paths:
       - Dockerfile
       - versions.env
+      - docker-entrypoint.sh
+      - minio-healthcheck
+      - test/**
       - .github/workflows/build.yml
   workflow_dispatch:
     inputs:
@@ -55,6 +62,31 @@ jobs:
           echo "tags=$tags" >> "$GITHUB_OUTPUT"
 
       - uses: docker/setup-buildx-action@v3
+
+      - name: Build for the smoke test (linux/amd64, loaded locally)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          load: true
+          push: false
+          tags: insectai/minio:smoke
+          build-args: |
+            GO_IMAGE=${{ env.GO_IMAGE }}
+            RUNTIME_IMAGE=${{ env.RUNTIME_IMAGE }}
+            MINIO_REPO=${{ env.MINIO_REPO }}
+            MINIO_TAG=${{ env.MINIO_TAG }}
+            MINIO_COMMIT=${{ env.MINIO_COMMIT }}
+            MC_REPO=${{ env.MC_REPO }}
+            MC_TAG=${{ env.MC_TAG }}
+            MC_COMMIT=${{ env.MC_COMMIT }}
+            SOURCE_REVISION=${{ github.sha }}
+          provenance: false
+          sbom: false
+          cache-from: type=gha
+
+      - name: Smoke test
+        run: test/smoke.sh insectai/minio:smoke
 
       - name: Log in to Docker Hub
         if: steps.mode.outputs.push == 'true'

@@ -75,7 +75,12 @@ LABEL org.opencontainers.image.title="MinIO server and mc client (community buil
       org.insectai.mc.commit="${MC_COMMIT}"
 COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 COPY --from=build /out/ /
+# The entrypoint creates MINIO_DEFAULT_BUCKETS at startup; the health check reports healthy only once the
+# server is ready and those buckets exist. See README "Creating buckets at startup".
+COPY --chmod=0755 docker-entrypoint.sh /usr/bin/docker-entrypoint.sh
+COPY --chmod=0755 minio-healthcheck /usr/bin/minio-healthcheck
 EXPOSE 9000 9001
 VOLUME ["/data"]
-ENTRYPOINT ["/usr/bin/minio"]
+HEALTHCHECK --interval=5s --timeout=5s --start-period=10s --retries=12 CMD ["/usr/bin/minio-healthcheck"]
+ENTRYPOINT ["/usr/bin/docker-entrypoint.sh"]
 CMD ["server", "/data", "--console-address", ":9001"]

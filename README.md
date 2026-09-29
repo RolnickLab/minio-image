@@ -14,7 +14,9 @@ The `insectai` organisation is a Docker-Sponsored Open Source namespace, so anon
 |---|---|---|
 | `/usr/bin/minio` | [pgsty/silo](https://github.com/pgsty/silo), the community-maintained fork of `minio/minio` | Built with the fork's own `gen-ldflags.go`, so `minio --version` reports the pinned release. |
 | `/usr/bin/mc` | [pgsty/mc](https://github.com/pgsty/mc), the matching fork of `minio/mc` | Same command set as upstream `mc` (`alias set`, `mb`, `anonymous set`, `ready`). |
-| `/bin/sh` and BusyBox | Alpine base | Lets an init container run a shell script with `mc`. |
+| `/usr/bin/docker-entrypoint.sh` | This repository | Starts the server and creates the buckets listed in `MINIO_DEFAULT_BUCKETS`. |
+| `/usr/bin/minio-healthcheck` | This repository | The image's health check: healthy once the server is ready and those buckets exist. |
+| `/bin/sh` and BusyBox | Alpine base | Runs the two scripts above, and lets you run your own shell scripts with `mc`. |
 | `/licenses/` | Copied from the source checkouts | AGPL-3.0 licence, NOTICE and CREDITS files. |
 
 The binaries keep their original names (`minio`, `mc`) so existing compose files and scripts work unchanged. The image runs as root by default, like the historical official image, and `/data` is world-writable so a non-root `user:` also works on a fresh volume.
@@ -35,15 +37,48 @@ docker buildx imagetools inspect insectai/minio:RELEASE.2026-09-16T00-00-00Z
 services:
   minio:
     image: insectai/minio:RELEASE.2026-09-16T00-00-00Z@sha256:<digest>
-    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: change-me-please
+      MINIO_DEFAULT_BUCKETS: media:public,backups
     healthcheck:
-      test: ["CMD", "mc", "ready", "local"]
-  minio-init:
-    image: insectai/minio:RELEASE.2026-09-16T00-00-00Z@sha256:<digest>
-    entrypoint: ["/bin/sh", "/etc/minio/init.sh"]
+      test: ["CMD", "minio-healthcheck"]
+      interval: 5s
+      retries: 12
+
+  app:
+    depends_on:
+      minio:
+        condition: service_healthy
 ```
 
+The default command is `server /data --console-address ":9001"`, so the `command:` line can be left out. The `healthcheck:` block above only repeats the image's built-in health check with a shorter interval; it can also be left out.
+
 The image tag is the server release tag. The client version is recorded in the `org.insectai.mc.tag` label.
+
+## Creating buckets at startup
+
+Set `MINIO_DEFAULT_BUCKETS` to a comma-separated list of buckets, each optionally followed by a colon and an anonymous-access policy:
+
+```sh
+MINIO_DEFAULT_BUCKETS=media:public,uploads:upload,backups
+```
+
+The policy is one of the values `mc anonymous set` accepts: `none`, `download` (anonymous read), `upload` (anonymous write) or `public` (anonymous read and write). A bucket without a policy is created private. The variable name and format are the same as in the Bitnami MinIO image, so this setting carries over from compose files written for that image. Bitnami's other variables (such as its port settings) are not supported.
+
+When the variable is set, the entrypoint starts the server, waits until it is ready, creates each missing bucket, applies its policy, and logs one line per bucket. Existing buckets and their contents are left alone, and the policy is applied again on every start. If any step fails (an invalid bucket name, an unknown policy, wrong credentials), the entrypoint stops the server and the container exits with a non-zero status, so a misconfiguration is visible immediately instead of surfacing later as missing buckets. The server stays the container's main process: `docker stop` is forwarded to it and the container's exit code is the server's.
+
+When the variable is not set, the entrypoint hands straight over to the server, so the image behaves exactly as it did before this feature existed. Any command other than `server ...` (for example `--version`) is passed to the `minio` binary unchanged, and `--entrypoint mc` still runs the client.
+
+### Health check
+
+The image declares a Docker `HEALTHCHECK` that runs `/usr/bin/minio-healthcheck`. It reports healthy only when the server answers its readiness probe and, if `MINIO_DEFAULT_BUCKETS` is set, the entrypoint has finished setting up the buckets (it writes a marker file, `/tmp/minio-default-buckets.ready`, as its last step). In compose, `depends_on: {minio: {condition: service_healthy}}` therefore means "the server is up and the buckets are in place", which replaces a separate init container.
+
+### Limits
+
+- The scripts talk to the server over plain HTTP on `127.0.0.1`. The API port is taken from the server's `--address` argument (for example `--address :9100`) and defaults to 9000. TLS on the API port is not supported by the bucket setup.
+- The root credentials come from `MINIO_ROOT_USER` and `MINIO_ROOT_PASSWORD`. Credentials supplied only through files or other mechanisms are not read.
+- The entrypoint waits up to 120 seconds for the server to become ready before giving up. Set `MINIO_DEFAULT_BUCKETS_TIMEOUT` (in seconds) to change this.
 
 ## Bumping versions
 
@@ -60,9 +95,10 @@ The image tag is the server release tag. The client version is recorded in the `
 
    ```sh
    ./build.sh
-   docker run --rm insectai/minio:dev --version
-   docker run --rm --entrypoint mc insectai/minio:dev --version
+   test/smoke.sh insectai/minio:dev
    ```
+
+   The smoke test starts the image with and without `MINIO_DEFAULT_BUCKETS`, checks bucket creation, anonymous access, the health check, `--version` output and clean shutdown, and removes everything it created. The workflow runs the same script on every pull request.
 
 5. Open a pull request. The workflow builds both platforms without pushing.
 6. Merge to `main`. The workflow pushes `insectai/minio:<MINIO_TAG>` and `insectai/minio:latest`, and prints the digest pin line in the run summary.
