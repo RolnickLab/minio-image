@@ -27,16 +27,26 @@ Exact source revisions are recorded in `versions.env` and in the image labels (`
 
 ## Using the image
 
-Pin by tag and digest in compose files. The digest for each published tag is printed in the workflow run's summary. To look it up later, read the first `Digest:` line (the manifest list, which covers both platforms) from:
+Every published build gets three tags:
+
+| Tag | Example | Moves? |
+|---|---|---|
+| `<release>-r<revision>` | `insectai/minio:RELEASE.2026-09-16T00-00-00Z-r1` | Never. Each build of a release gets the next revision number (`IMAGE_REVISION` in `versions.env`), and a revision tag is never overwritten. |
+| `<release>` | `insectai/minio:RELEASE.2026-09-16T00-00-00Z` | Yes, to the newest build of that release (for example a rebuild with newer base images). |
+| `latest` | `insectai/minio:latest` | Yes, to the newest build of the newest release. |
+
+The release is the server release tag. A new revision of the same release contains the same `minio` and `mc` source code, rebuilt with newer Go toolchain or Alpine base images; the revision restarts at 1 when the release changes.
+
+In compose files, pin by the revision tag and its digest: `insectai/minio:<release>-r<revision>@sha256:<digest>`. The tag tells a reader what they are running, and the digest guarantees the bytes. The pin line for each build is printed in the workflow run's summary. To look up the digest later, read the first `Digest:` line (the manifest list, which covers both platforms) from:
 
 ```sh
-docker buildx imagetools inspect insectai/minio:RELEASE.2026-09-16T00-00-00Z
+docker buildx imagetools inspect insectai/minio:RELEASE.2026-09-16T00-00-00Z-r1
 ```
 
 ```yaml
 services:
   minio:
-    image: insectai/minio:RELEASE.2026-09-16T00-00-00Z@sha256:<digest>
+    image: insectai/minio:RELEASE.2026-09-16T00-00-00Z-r1@sha256:<digest>
     environment:
       MINIO_ROOT_USER: minioadmin
       MINIO_ROOT_PASSWORD: change-me-please
@@ -54,7 +64,7 @@ services:
 
 The default command is `server /data --console-address ":9001"`, so the `command:` line can be left out. The `healthcheck:` block above only repeats the image's built-in health check with a shorter interval; it can also be left out.
 
-The image tag is the server release tag. The client version is recorded in the `org.insectai.mc.tag` label.
+The client version is recorded in the `org.insectai.mc.tag` label.
 
 ## Creating buckets at startup
 
