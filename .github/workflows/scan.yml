@@ -10,6 +10,8 @@ name: Scan published image
 # workflow proposes.
 
 on:
+  push: # TEMPORARY: test trigger, removed before review
+    branches: [feat/automated-updates]
   schedule:
     - cron: "0 6 * * 2" # Tuesdays 06:00 UTC
   workflow_dispatch:
