@@ -90,7 +90,39 @@ The image declares a Docker `HEALTHCHECK` that runs `/usr/bin/minio-healthcheck`
 - The root credentials come from `MINIO_ROOT_USER` and `MINIO_ROOT_PASSWORD`. Credentials supplied only through files or other mechanisms are not read.
 - The entrypoint waits up to 120 seconds for the server to become ready before giving up. Set `MINIO_DEFAULT_BUCKETS_TIMEOUT` (in seconds) to change this.
 
+## Keeping the image up to date
+
+Three scheduled workflows keep the image current. A person only reviews and merges pull requests; nothing is published without a merge.
+
+| When | Workflow | What it does |
+|---|---|---|
+| Mondays 06:00 UTC | Check for updates (`update.yml`) | Runs `scripts/check_upstream.py`. If pgsty/silo or pgsty/mc published a new release, it proposes the new pins with `IMAGE_REVISION=1`. Otherwise, if the Go or Alpine base image has a newer patch release, or the published image is more than 30 days old, it proposes a rebuild of the same release with the next `IMAGE_REVISION`. With the 30-day threshold, the weekly check produces a rebuild about once a month. The proposed change is built for linux/amd64 and smoke-tested before the pull request is opened on the `update/versions` branch. |
+| Tuesdays 06:00 UTC, and after every publish | Scan published image (`scan.yml`) | Scans `insectai/minio:latest` with Trivy. Findings rated CRITICAL or HIGH that have a fix available fail the run and are listed under the repository's Security tab. Trivy also reads the Go modules compiled into `minio` and `mc`, which is where most findings for this image come from. |
+| Every merge to `main` | Build and push image (`build.yml`) | Publishes the three tags described in "Using the image". |
+
+What a person does:
+
+- **Update pull request:** read the old/new table and the linked upstream release notes, check that the build and smoke test passed (the run is linked in the pull request), and merge. Merging publishes the image. Then update the digest pins in the repositories that use it.
+- **Failed scan:** open the run summary or the Security tab to see the affected package and the fixed version. A fix usually needs a new upstream release or a newer base image, which the update workflow proposes when one exists. If upstream has not fixed it yet, the finding stays open until it does.
+
+To force a rebuild of the current release now (for example after an Alpine security announcement), run:
+
+```sh
+gh workflow run update.yml -f force_rebuild=true
+```
+
+Pull requests opened by a workflow with the default `GITHUB_TOKEN` do not trigger other workflows, so the update pull request does not get the normal pull-request build. That is why the update workflow builds and smoke-tests before opening it. To get the normal checks as well, add a repository secret `UPDATE_PR_TOKEN` holding a fine-grained personal access token with read and write access to contents and pull requests on this repository; the update workflow uses it when it is set.
+
 ## Bumping versions
+
+The update workflow does steps 1 to 3 every week. The same script can be run locally to see what it would change (set `GITHUB_TOKEN` to avoid GitHub's anonymous rate limit; `--write` applies the change to `versions.env`):
+
+```sh
+python3 scripts/check_upstream.py --dry-run
+python3 scripts/check_upstream.py --force-rebuild --dry-run   # what a rebuild would look like
+```
+
+The manual steps, for reference or when the script cannot decide (for example when a new Go minor needs a different Alpine minor):
 
 1. Find the new release tags on [pgsty/silo/releases](https://github.com/pgsty/silo/releases) and [pgsty/mc/releases](https://github.com/pgsty/mc/releases), and read their release notes for behaviour changes.
 2. Resolve each tag to its commit (annotated tags need the second command):
@@ -100,7 +132,7 @@ The image declares a Docker `HEALTHCHECK` that runs `/usr/bin/minio-healthcheck`
    gh api repos/pgsty/silo/git/tags/<tag-object-sha> -q .object.sha
    ```
 
-3. Edit `versions.env`: `MINIO_TAG`, `MINIO_COMMIT`, `MC_TAG`, `MC_COMMIT`. Check the `go` directive in both `go.mod` files and raise `GO_IMAGE` if needed. Bump `RUNTIME_IMAGE` to the current Alpine patch release.
+3. Edit `versions.env`: `MINIO_TAG`, `MINIO_COMMIT`, `MC_TAG`, `MC_COMMIT`, and set `IMAGE_REVISION=1`. Check the `go` directive in both `go.mod` files and raise `GO_IMAGE` if needed. Bump `RUNTIME_IMAGE` to the current Alpine patch release. To rebuild the same release instead, leave the tags alone and raise `IMAGE_REVISION` by one.
 4. Build locally and smoke-test:
 
    ```sh
@@ -111,17 +143,19 @@ The image declares a Docker `HEALTHCHECK` that runs `/usr/bin/minio-healthcheck`
    The smoke test starts the image with and without `MINIO_DEFAULT_BUCKETS`, checks bucket creation, anonymous access, the health check, `--version` output and clean shutdown, and removes everything it created. The workflow runs the same script on every pull request.
 
 5. Open a pull request. The workflow builds both platforms without pushing.
-6. Merge to `main`. The workflow pushes `insectai/minio:<MINIO_TAG>` and `insectai/minio:latest`, and prints the digest pin line in the run summary.
+6. Merge to `main`. The workflow pushes `insectai/minio:<MINIO_TAG>-r<IMAGE_REVISION>`, `insectai/minio:<MINIO_TAG>` and `insectai/minio:latest`, and prints the digest pin line in the run summary.
 7. Update the digest pins in the consuming repositories (for Antenna: `docker-compose.yml` and `docker-compose.ci.yml`).
 
-To republish an existing version without moving `latest` (for example after a base-image security update), run the workflow manually with "Also move the latest tag" unchecked.
+A revision tag is never overwritten: if `<MINIO_TAG>-r<IMAGE_REVISION>` already exists on Docker Hub, the workflow builds but pushes nothing. To publish a build without moving `latest`, raise `IMAGE_REVISION` and run the workflow manually with "Also move the latest tag" unchecked.
 
 ## Publishing setup
 
-The workflow needs two repository secrets:
+The build workflow needs two repository secrets:
 
 - `DOCKERHUB_USERNAME`: the Docker Hub account or organisation the token belongs to.
 - `DOCKERHUB_TOKEN`: an access token with read and write access to `insectai/minio`. Create it under the Docker Hub organisation settings (organisation access token) or as a personal access token of an organisation member.
+
+The update workflow can optionally use `UPDATE_PR_TOKEN` (see "Keeping the image up to date"). The scan workflow needs no secrets.
 
 ## Licence
 
