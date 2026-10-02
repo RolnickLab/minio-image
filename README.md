@@ -14,7 +14,9 @@ The `insectai` organisation is a Docker-Sponsored Open Source namespace, so anon
 |---|---|---|
 | `/usr/bin/minio` | [pgsty/silo](https://github.com/pgsty/silo), the community-maintained fork of `minio/minio` | Built with the fork's own `gen-ldflags.go`, so `minio --version` reports the pinned release. |
 | `/usr/bin/mc` | [pgsty/mc](https://github.com/pgsty/mc), the matching fork of `minio/mc` | Same command set as upstream `mc` (`alias set`, `mb`, `anonymous set`, `ready`). |
-| `/bin/sh` and BusyBox | Alpine base | Lets an init container run a shell script with `mc`. |
+| `/usr/bin/docker-entrypoint.sh` | This repository | Starts the server and creates the buckets listed in `MINIO_DEFAULT_BUCKETS`. |
+| `/usr/bin/minio-healthcheck` | This repository | The image's health check: healthy once the server is ready and those buckets exist. |
+| `/bin/sh` and BusyBox | Alpine base | Runs the two scripts above, and lets you run your own shell scripts with `mc`. |
 | `/licenses/` | Copied from the source checkouts | AGPL-3.0 licence, NOTICE and CREDITS files. |
 
 The binaries keep their original names (`minio`, `mc`) so existing compose files and scripts work unchanged. The image runs as root by default, like the historical official image, and `/data` is world-writable so a non-root `user:` also works on a fresh volume.
@@ -25,27 +27,102 @@ Exact source revisions are recorded in `versions.env` and in the image labels (`
 
 ## Using the image
 
-Pin by tag and digest in compose files. The digest for each published tag is printed in the workflow run's summary. To look it up later, read the first `Digest:` line (the manifest list, which covers both platforms) from:
+Every published build gets three tags:
+
+| Tag | Example | Moves? |
+|---|---|---|
+| `<release>-r<revision>` | `insectai/minio:RELEASE.2026-09-16T00-00-00Z-r1` | Never. Each build of a release gets the next revision number (`IMAGE_REVISION` in `versions.env`), and a revision tag is never overwritten. |
+| `<release>` | `insectai/minio:RELEASE.2026-09-16T00-00-00Z` | Yes, to the newest build of that release (for example a rebuild with newer base images). |
+| `latest` | `insectai/minio:latest` | Yes, to the newest build of the newest release. |
+
+The release is the server release tag. A new revision of the same release contains the same `minio` and `mc` source code, rebuilt with newer Go toolchain or Alpine base images; the revision restarts at 1 when the release changes.
+
+In compose files, pin by the revision tag and its digest: `insectai/minio:<release>-r<revision>@sha256:<digest>`. The tag tells a reader what they are running, and the digest guarantees the bytes. The pin line for each build is printed in the workflow run's summary. To look up the digest later, read the first `Digest:` line (the manifest list, which covers both platforms) from:
 
 ```sh
-docker buildx imagetools inspect insectai/minio:RELEASE.2026-09-16T00-00-00Z
+docker buildx imagetools inspect insectai/minio:RELEASE.2026-09-16T00-00-00Z-r1
 ```
 
 ```yaml
 services:
   minio:
-    image: insectai/minio:RELEASE.2026-09-16T00-00-00Z@sha256:<digest>
-    command: server /data --console-address ":9001"
+    image: insectai/minio:RELEASE.2026-09-16T00-00-00Z-r1@sha256:<digest>
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: change-me-please
+      MINIO_DEFAULT_BUCKETS: media:public,backups
     healthcheck:
-      test: ["CMD", "mc", "ready", "local"]
-  minio-init:
-    image: insectai/minio:RELEASE.2026-09-16T00-00-00Z@sha256:<digest>
-    entrypoint: ["/bin/sh", "/etc/minio/init.sh"]
+      test: ["CMD", "minio-healthcheck"]
+      interval: 5s
+      retries: 12
+
+  app:
+    depends_on:
+      minio:
+        condition: service_healthy
 ```
 
-The image tag is the server release tag. The client version is recorded in the `org.insectai.mc.tag` label.
+The default command is `server /data --console-address ":9001"`, so the `command:` line can be left out. The `healthcheck:` block above only repeats the image's built-in health check with a shorter interval; it can also be left out.
+
+The client version is recorded in the `org.insectai.mc.tag` label.
+
+## Creating buckets at startup
+
+Set `MINIO_DEFAULT_BUCKETS` to a comma-separated list of buckets, each optionally followed by a colon and an anonymous-access policy:
+
+```sh
+MINIO_DEFAULT_BUCKETS=media:public,uploads:upload,backups
+```
+
+The policy is one of the values `mc anonymous set` accepts: `none`, `download` (anonymous read), `upload` (anonymous write) or `public` (anonymous read and write). A bucket without a policy is created private. The variable name and format are the same as in the Bitnami MinIO image, so this setting carries over from compose files written for that image. Bitnami's other variables (such as its port settings) are not supported.
+
+When the variable is set, the entrypoint starts the server, waits until it is ready, creates each missing bucket, applies its policy, and logs one line per bucket. Existing buckets and their contents are left alone, and the policy is applied again on every start. If any step fails (an invalid bucket name, an unknown policy, wrong credentials), the entrypoint stops the server and the container exits with a non-zero status, so a misconfiguration is visible immediately instead of surfacing later as missing buckets. The server stays the container's main process: `docker stop` is forwarded to it and the container's exit code is the server's.
+
+When the variable is not set, the entrypoint hands straight over to the server, so the image behaves exactly as it did before this feature existed. Any command other than `server ...` (for example `--version`) is passed to the `minio` binary unchanged, and `--entrypoint mc` still runs the client.
+
+### Health check
+
+The image declares a Docker `HEALTHCHECK` that runs `/usr/bin/minio-healthcheck`. It reports healthy only when the server answers its readiness probe and, if `MINIO_DEFAULT_BUCKETS` is set, the entrypoint has finished setting up the buckets (it writes a marker file, `/tmp/minio-default-buckets.ready`, as its last step). In compose, `depends_on: {minio: {condition: service_healthy}}` therefore means "the server is up and the buckets are in place", which replaces a separate init container.
+
+### Limits
+
+- The scripts talk to the server over plain HTTP on `127.0.0.1`. The API port is taken from the server's `--address` argument (for example `--address :9100`) and defaults to 9000. TLS on the API port is not supported by the bucket setup.
+- The root credentials come from `MINIO_ROOT_USER` and `MINIO_ROOT_PASSWORD`. Credentials supplied only through files or other mechanisms are not read.
+- The entrypoint waits up to 120 seconds for the server to become ready before giving up. Set `MINIO_DEFAULT_BUCKETS_TIMEOUT` (in seconds) to change this.
+
+## Keeping the image up to date
+
+Three scheduled workflows keep the image current. A person only reviews and merges pull requests; nothing is published without a merge.
+
+| When | Workflow | What it does |
+|---|---|---|
+| Mondays 06:00 UTC | Check for updates (`update.yml`) | Runs `scripts/check_upstream.py`. If pgsty/silo or pgsty/mc published a new release, it proposes the new pins with `IMAGE_REVISION=1`. Otherwise, if the Go or Alpine base image has a newer patch release, it proposes a rebuild of the same release with the next `IMAGE_REVISION`. (An age-based rebuild can be switched on with the `rebuild_if_older_than_days` input; it is off by default because the runtime stage only copies files onto the pinned Alpine image, so rebuilding unchanged pins produces the same image.) The proposed change is built for linux/amd64 and smoke-tested before the pull request is opened on the `update/versions` branch. |
+| Tuesdays 06:00 UTC, and after every publish | Scan published image (`scan.yml`) | Scans `insectai/minio:latest` with Trivy. Findings rated CRITICAL or HIGH that have a fix available fail the run and are listed under the repository's Security tab. Trivy also reads the Go modules compiled into `minio` and `mc`, which is where most findings for this image come from. |
+| Every merge to `main` | Build and push image (`build.yml`) | Publishes the three tags described in "Using the image". |
+
+What a person does:
+
+- **Update pull request:** read the old/new table and the linked upstream release notes, check that the build and smoke test passed (the run is linked in the pull request), and merge. Merging publishes the image. Then update the digest pins in the repositories that use it.
+- **Failed scan:** open the run summary or the Security tab to see the affected package and the fixed version. A fix usually needs a new upstream release or a newer base image, which the update workflow proposes when one exists. If upstream has not fixed it yet, the finding stays open until it does.
+
+To force a rebuild of the current release now (for example after an Alpine security announcement), run:
+
+```sh
+gh workflow run update.yml -f force_rebuild=true
+```
+
+Pull requests opened by a workflow with the default `GITHUB_TOKEN` do not trigger other workflows, so the update pull request does not get the normal pull-request build. That is why the update workflow builds and smoke-tests before opening it. To get the normal checks as well, add a repository secret `UPDATE_PR_TOKEN` holding a fine-grained personal access token with read and write access to contents and pull requests on this repository; the update workflow uses it when it is set.
 
 ## Bumping versions
+
+The update workflow does steps 1 to 3 every week. The same script can be run locally to see what it would change (set `GITHUB_TOKEN` to avoid GitHub's anonymous rate limit; `--write` applies the change to `versions.env`):
+
+```sh
+python3 scripts/check_upstream.py --dry-run
+python3 scripts/check_upstream.py --force-rebuild --dry-run   # what a rebuild would look like
+```
+
+The manual steps, for reference or when the script cannot decide (for example when a new Go minor needs a different Alpine minor):
 
 1. Find the new release tags on [pgsty/silo/releases](https://github.com/pgsty/silo/releases) and [pgsty/mc/releases](https://github.com/pgsty/mc/releases), and read their release notes for behaviour changes.
 2. Resolve each tag to its commit (annotated tags need the second command):
@@ -55,27 +132,30 @@ The image tag is the server release tag. The client version is recorded in the `
    gh api repos/pgsty/silo/git/tags/<tag-object-sha> -q .object.sha
    ```
 
-3. Edit `versions.env`: `MINIO_TAG`, `MINIO_COMMIT`, `MC_TAG`, `MC_COMMIT`. Check the `go` directive in both `go.mod` files and raise `GO_IMAGE` if needed. Bump `RUNTIME_IMAGE` to the current Alpine patch release.
+3. Edit `versions.env`: `MINIO_TAG`, `MINIO_COMMIT`, `MC_TAG`, `MC_COMMIT`, and set `IMAGE_REVISION=1`. Check the `go` directive in both `go.mod` files and raise `GO_IMAGE` if needed. Bump `RUNTIME_IMAGE` to the current Alpine patch release. To rebuild the same release instead, leave the tags alone and raise `IMAGE_REVISION` by one.
 4. Build locally and smoke-test:
 
    ```sh
    ./build.sh
-   docker run --rm insectai/minio:dev --version
-   docker run --rm --entrypoint mc insectai/minio:dev --version
+   test/smoke.sh insectai/minio:dev
    ```
 
+   The smoke test starts the image with and without `MINIO_DEFAULT_BUCKETS`, checks bucket creation, anonymous access, the health check, `--version` output and clean shutdown, and removes everything it created. The workflow runs the same script on every pull request.
+
 5. Open a pull request. The workflow builds both platforms without pushing.
-6. Merge to `main`. The workflow pushes `insectai/minio:<MINIO_TAG>` and `insectai/minio:latest`, and prints the digest pin line in the run summary.
+6. Merge to `main`. The workflow pushes `insectai/minio:<MINIO_TAG>-r<IMAGE_REVISION>`, `insectai/minio:<MINIO_TAG>` and `insectai/minio:latest`, and prints the digest pin line in the run summary.
 7. Update the digest pins in the consuming repositories (for Antenna: `docker-compose.yml` and `docker-compose.ci.yml`).
 
-To republish an existing version without moving `latest` (for example after a base-image security update), run the workflow manually with "Also move the latest tag" unchecked.
+A revision tag is never overwritten: if `<MINIO_TAG>-r<IMAGE_REVISION>` already exists on Docker Hub, the workflow builds but pushes nothing. To publish a build without moving `latest`, raise `IMAGE_REVISION` and run the workflow manually with "Also move the latest tag" unchecked.
 
 ## Publishing setup
 
-The workflow needs two repository secrets:
+The build workflow needs two repository secrets:
 
 - `DOCKERHUB_USERNAME`: the Docker Hub account or organisation the token belongs to.
 - `DOCKERHUB_TOKEN`: an access token with read and write access to `insectai/minio`. Create it under the Docker Hub organisation settings (organisation access token) or as a personal access token of an organisation member.
+
+The update workflow can optionally use `UPDATE_PR_TOKEN` (see "Keeping the image up to date"). The scan workflow needs no secrets.
 
 ## Licence
 

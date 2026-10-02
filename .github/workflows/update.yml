@@ -1,0 +1,133 @@
+name: Check for updates
+
+# Weekly: asks scripts/check_upstream.py whether versions.env needs a change. A change is either a new
+# upstream release (new pins, IMAGE_REVISION back to 1) or a rebuild of the current release (IMAGE_REVISION + 1)
+# because a base image has a newer patch release (or, if rebuild_if_older_than_days is set, because the published
+# image is older than that). The age rule is off by default: the runtime stage only copies files onto the pinned
+# Alpine image, so a rebuild with unchanged pins produces the same image; newer Go or Alpine patch tags are what
+# matter, and the script detects those on its own.
+#
+# When something changed, the new pins are built for linux/amd64 and smoke-tested here, and only then is a
+# pull request opened on the update/versions branch. Merging that pull request publishes the image through
+# the "Build and push image" workflow. Nothing is published from this workflow.
+#
+# Pull requests opened with the default GITHUB_TOKEN do not trigger other workflows, which is why the build
+# and smoke test run inline. If the UPDATE_PR_TOKEN secret (a fine-grained token with contents and pull
+# requests write access to this repository) is set, it is used instead and the normal PR checks run too.
+
+on:
+  schedule:
+    - cron: "0 6 * * 1" # Mondays 06:00 UTC
+  workflow_dispatch:
+    inputs:
+      force_rebuild:
+        description: Rebuild the current release with the next IMAGE_REVISION even if nothing changed
+        type: boolean
+        default: false
+      rebuild_if_older_than_days:
+        description: Also rebuild when the published image is older than this many days (0 = off)
+        type: number
+        default: 0
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: update-versions
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check upstream
+        id: check
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Scheduled runs have no inputs; fall back to the defaults above.
+          OLDER_THAN: ${{ inputs.rebuild_if_older_than_days || 0 }}
+          FORCE: ${{ inputs.force_rebuild && 'true' || 'false' }}
+        run: |
+          args=(--write --github-output "$GITHUB_OUTPUT")
+          if [ "${OLDER_THAN:-0}" -gt 0 ]; then args+=(--rebuild-if-older-than "$OLDER_THAN"); fi
+          if [ "$FORCE" = "true" ]; then args+=(--force-rebuild); fi
+          python3 scripts/check_upstream.py "${args[@]}"
+
+      - name: Summary (no change)
+        if: steps.check.outputs.changed != 'true'
+        run: |
+          echo "No update needed: pins are current and the published image is recent." >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Load the new pins
+        if: steps.check.outputs.changed == 'true'
+        run: grep -v '^#' versions.env | grep . >> "$GITHUB_ENV"
+
+      - uses: docker/setup-buildx-action@v3
+        if: steps.check.outputs.changed == 'true'
+
+      - name: Build the new pins (linux/amd64, loaded locally)
+        if: steps.check.outputs.changed == 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          load: true
+          push: false
+          tags: insectai/minio:update-check
+          build-args: |
+            GO_IMAGE=${{ env.GO_IMAGE }}
+            RUNTIME_IMAGE=${{ env.RUNTIME_IMAGE }}
+            MINIO_REPO=${{ env.MINIO_REPO }}
+            MINIO_TAG=${{ env.MINIO_TAG }}
+            MINIO_COMMIT=${{ env.MINIO_COMMIT }}
+            MC_REPO=${{ env.MC_REPO }}
+            MC_TAG=${{ env.MC_TAG }}
+            MC_COMMIT=${{ env.MC_COMMIT }}
+            SOURCE_REVISION=${{ github.sha }}
+          provenance: false
+          sbom: false
+          cache-from: type=gha
+
+      - name: Smoke test
+        if: steps.check.outputs.changed == 'true'
+        run: test/smoke.sh insectai/minio:update-check
+
+      - name: Open or update the pull request
+        if: steps.check.outputs.changed == 'true'
+        id: pr
+        uses: peter-evans/create-pull-request@v7
+        with:
+          token: ${{ secrets.UPDATE_PR_TOKEN || secrets.GITHUB_TOKEN }}
+          branch: update/versions
+          delete-branch: true
+          add-paths: versions.env
+          commit-message: |
+            chore: update pinned versions
+
+            ${{ steps.check.outputs.title }}
+          title: ${{ steps.check.outputs.title }}
+          body: |
+            ${{ steps.check.outputs.body }}
+
+            Built for linux/amd64 and smoke-tested in run ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }} before this PR was opened.
+
+            Merging this pull request publishes the image to Docker Hub (the "Build and push image" workflow pushes the revision tag, the release tag and `latest`). After that, update the digest pins in the repositories that use the image.
+
+      - name: Summary (change)
+        if: steps.check.outputs.changed == 'true'
+        env:
+          TITLE: ${{ steps.check.outputs.title }}
+          PR_URL: ${{ steps.pr.outputs.pull-request-url }}
+          PR_OP: ${{ steps.pr.outputs.pull-request-operation }}
+          BODY: ${{ steps.check.outputs.body }}
+        run: |
+          {
+            echo "## $TITLE"
+            echo
+            echo "Built and smoke-tested. Pull request ($PR_OP): $PR_URL"
+            echo
+            echo "$BODY"
+          } >> "$GITHUB_STEP_SUMMARY"

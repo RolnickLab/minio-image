@@ -1,0 +1,17 @@
+#!/bin/sh
+# Health check for the image: succeeds only when the server answers its readiness probe and, if
+# MINIO_DEFAULT_BUCKETS is set, the entrypoint has finished creating those buckets. Compose files can
+# therefore use `condition: service_healthy` to mean "server up and buckets in place".
+set -eu
+
+port="$(cat /tmp/minio-api-port 2>/dev/null || echo 9000)"
+
+# A throwaway config directory works whichever uid the container runs as.
+export MC_CONFIG_DIR=/tmp/minio-healthcheck-mc
+
+# `mc ready` retries forever on its own, so bound it; the health check runs again on the next interval.
+MC_HOST_local="http://127.0.0.1:${port}" timeout 3 mc ready local >/dev/null 2>&1
+
+if [ -n "${MINIO_DEFAULT_BUCKETS:-}" ] && [ ! -f /tmp/minio-default-buckets.ready ]; then
+    exit 1
+fi
