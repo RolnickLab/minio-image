@@ -1,0 +1,81 @@
+name: Scan published image
+
+# Scans the published insectai/minio:latest for known vulnerabilities with Trivy: weekly, on demand, and after
+# every successful publish from main. Findings rated CRITICAL or HIGH that have a fix available fail the run
+# and appear under the repository's Security tab (code scanning).
+#
+# Trivy reads the Go module list embedded in the compiled minio and mc binaries, so it reports vulnerable Go
+# dependencies and Go standard library versions, not only Alpine packages. For this image that is the main
+# signal: most fixes arrive as a new upstream release or a newer GO_IMAGE, which the "Check for updates"
+# workflow proposes.
+
+on:
+  schedule:
+    - cron: "0 6 * * 2" # Tuesdays 06:00 UTC
+  workflow_dispatch:
+  workflow_run:
+    workflows: ["Build and push image"]
+    types: [completed]
+    branches: [main]
+
+permissions:
+  contents: read
+  security-events: write
+
+env:
+  IMAGE_REF: insectai/minio:latest
+
+jobs:
+  scan:
+    # After a publish, only scan when the build succeeded.
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      # Pinned by commit: v0.36.0.
+      - name: Scan for the Security tab (SARIF)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25
+        with:
+          scan-type: image
+          image-ref: ${{ env.IMAGE_REF }}
+          format: sarif
+          output: trivy-results.sarif
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: "0"
+
+      - name: Upload to code scanning
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-results.sarif
+          category: trivy-published-image
+
+      # Every input is repeated here because trivy-action carries some settings over between calls in one job.
+      - name: Scan and fail on CRITICAL or HIGH findings
+        id: table
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25
+        with:
+          scan-type: image
+          image-ref: ${{ env.IMAGE_REF }}
+          format: table
+          output: trivy-results.txt
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: "1"
+
+      - name: Write the findings to the run summary
+        if: always()
+        run: |
+          {
+            echo "## Trivy: \`$IMAGE_REF\` (CRITICAL and HIGH, fixable only)"
+            echo
+            if [ "${{ steps.table.outcome }}" = "success" ]; then
+              echo "No CRITICAL or HIGH findings with a fix available."
+            else
+              echo "Findings below. Fixes usually arrive as an upstream release or a newer GO_IMAGE/RUNTIME_IMAGE,"
+              echo "which the \"Check for updates\" workflow proposes; it can also be run by hand."
+            fi
+            echo
+            echo '```'
+            cat trivy-results.txt 2>/dev/null || echo "(no table output; see the step log)"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
