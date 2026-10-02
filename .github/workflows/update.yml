@@ -14,6 +14,8 @@ name: Check for updates
 # requests write access to this repository) is set, it is used instead and the normal PR checks run too.
 
 on:
+  push: # TEMPORARY: test trigger, removed before review
+    branches: [feat/automated-updates]
   schedule:
     - cron: "0 6 * * 1" # Mondays 06:00 UTC
   workflow_dispatch:
@@ -47,7 +49,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           # Scheduled runs have no inputs; fall back to the defaults above.
           OLDER_THAN: ${{ inputs.rebuild_if_older_than_days || 30 }}
-          FORCE: ${{ inputs.force_rebuild && 'true' || 'false' }}
+          FORCE: ${{ (inputs.force_rebuild || github.event_name == 'push') && 'true' || 'false' }}
         run: |
           args=(--write --rebuild-if-older-than "$OLDER_THAN" --github-output "$GITHUB_OUTPUT")
           if [ "$FORCE" = "true" ]; then args+=(--force-rebuild); fi
