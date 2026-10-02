@@ -46,6 +46,7 @@ import json
 import os
 import re
 import sys
+import typing
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -103,7 +104,7 @@ def http_get_json(url: str, headers: dict[str, str] | None = None, allow_404: bo
         raise LookupFailed(f"GET {url} did not return JSON") from error
 
 
-def github_get(path: str, raw: bool = False):
+def github_get(path: str, raw: bool = False) -> typing.Any:
     """GETs an api.github.com path; raw=True returns file contents as text instead of parsed JSON."""
     headers = {
         "Accept": "application/vnd.github.raw" if raw else "application/vnd.github+json",
@@ -113,7 +114,10 @@ def github_get(path: str, raw: bool = False):
     if token:
         headers["Authorization"] = f"Bearer {token}"
     url = f"https://api.github.com/{path}"
-    return http_get_text(url, headers) if raw else http_get_json(url, headers)
+    result = http_get_text(url, headers) if raw else http_get_json(url, headers)
+    if result is None:
+        raise LookupFailed(f"GitHub API returned no content for {path}")
+    return result
 
 
 # ---------------------------------------------------------------------------------------------------------
@@ -402,7 +406,7 @@ def write_github_output(path: str, decision: Decision, body: str) -> None:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser = argparse.ArgumentParser(description=(__doc__ or "").splitlines()[0])
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--write", action="store_true", help="rewrite versions.env in place")
     mode.add_argument("--dry-run", action="store_true", help="only report the decision (default)")

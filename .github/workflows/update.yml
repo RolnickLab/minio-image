@@ -2,8 +2,10 @@ name: Check for updates
 
 # Weekly: asks scripts/check_upstream.py whether versions.env needs a change. A change is either a new
 # upstream release (new pins, IMAGE_REVISION back to 1) or a rebuild of the current release (IMAGE_REVISION + 1)
-# because the published image is older than rebuild_if_older_than_days or a base image has a newer patch.
-# With the 30-day default, the weekly schedule produces a rebuild roughly once a month.
+# because a base image has a newer patch release (or, if rebuild_if_older_than_days is set, because the published
+# image is older than that). The age rule is off by default: the runtime stage only copies files onto the pinned
+# Alpine image, so a rebuild with unchanged pins produces the same image; newer Go or Alpine patch tags are what
+# matter, and the script detects those on its own.
 #
 # When something changed, the new pins are built for linux/amd64 and smoke-tested here, and only then is a
 # pull request opened on the update/versions branch. Merging that pull request publishes the image through
@@ -23,9 +25,9 @@ on:
         type: boolean
         default: false
       rebuild_if_older_than_days:
-        description: Rebuild when the published image is older than this many days
+        description: Also rebuild when the published image is older than this many days (0 = off)
         type: number
-        default: 30
+        default: 0
 
 permissions:
   contents: write
@@ -46,10 +48,11 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           # Scheduled runs have no inputs; fall back to the defaults above.
-          OLDER_THAN: ${{ inputs.rebuild_if_older_than_days || 30 }}
+          OLDER_THAN: ${{ inputs.rebuild_if_older_than_days || 0 }}
           FORCE: ${{ inputs.force_rebuild && 'true' || 'false' }}
         run: |
-          args=(--write --rebuild-if-older-than "$OLDER_THAN" --github-output "$GITHUB_OUTPUT")
+          args=(--write --github-output "$GITHUB_OUTPUT")
+          if [ "${OLDER_THAN:-0}" -gt 0 ]; then args+=(--rebuild-if-older-than "$OLDER_THAN"); fi
           if [ "$FORCE" = "true" ]; then args+=(--force-rebuild); fi
           python3 scripts/check_upstream.py "${args[@]}"
 
@@ -105,9 +108,6 @@ jobs:
             chore: update pinned versions
 
             ${{ steps.check.outputs.title }}
-
-            Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
-            Claude-Session: https://claude.ai/code/session_01FA1nFdyB4WmWTw4syt89Yz
           title: ${{ steps.check.outputs.title }}
           body: |
             ${{ steps.check.outputs.body }}
